@@ -3,7 +3,6 @@
 #include "EngineClasses/SpatialNetDriver.h"
 
 #include "Engine/ActorChannel.h"
-#include "Engine/ChildConnection.h"
 #include "Engine/Engine.h"
 #include "Engine/LocalPlayer.h"
 #include "Engine/NetworkObjectList.h"
@@ -33,7 +32,6 @@
 #include "Utils/ActorGroupManager.h"
 #include "Utils/EntityPool.h"
 #include "Utils/InterestFactory.h"
-#include "Utils/OpUtils.h"
 #include "Utils/SpatialMetrics.h"
 #include "Utils/SpatialMetricsDisplay.h"
 
@@ -73,7 +71,6 @@ bool USpatialNetDriver::InitBase(bool bInitAsClient, FNetworkNotify* InNotify, c
 
 	bConnectAsClient = bInitAsClient;
 	bAuthoritativeDestruction = true;
-	bIsReadyToStart = bInitAsClient;
 
 	FCoreUObjectDelegates::PostLoadMapWithWorld.AddUObject(this, &USpatialNetDriver::OnMapLoaded);
 
@@ -1246,29 +1243,17 @@ void USpatialNetDriver::TickDispatch(float DeltaTime)
 	// Not calling Super:: on purpose.
 	UNetDriver::TickDispatch(DeltaTime);
 
-	if (Connection != nullptr)
+	if (Connection == nullptr || !Connection->IsConnected())
 	{
-		TArray<Worker_OpList*> OpLists = Connection->GetOpList();
-
-		// Servers will queue ops at startup until we've extracted necessary information from the op stream
-		if (!bIsReadyToStart)
-		{
-			HandleStartupOpQueueing(OpLists);
-			return;
-		}
-
-		for (Worker_OpList* OpList : OpLists)
-		{
-			Dispatcher->ProcessOps(OpList);
-
-			Worker_OpList_Destroy(OpList);
-		}
-
-		if (SpatialMetrics != nullptr && GetDefault<USpatialGDKSettings>()->bEnableMetrics)
-		{
-			SpatialMetrics->TickMetrics();
-		}
+		return;
 	}
+
+	if (SpatialMetrics != nullptr && GetDefault<USpatialGDKSettings>()->bEnableMetrics)
+	{
+		SpatialMetrics->TickMetrics();
+	}
+	Connection->Advance();
+	Dispatcher->ProcessOps(Connection->GetWorker());
 }
 
 void USpatialNetDriver::ProcessRemoteFunction(
@@ -1360,7 +1345,7 @@ void USpatialNetDriver::TickFlush(float DeltaTime)
 	double ServerReplicateActorsTimeMs = 0.0f;
 #endif // USE_SERVER_PERF_COUNTERS
 
-	if (IsServer() && GetSpatialOSNetConnection() != nullptr && PackageMap->IsEntityPoolReady())
+	if (IsServer() && GetSpatialOSNetConnection() != nullptr && PackageMap->IsEntityPoolReady() && StaticComponentView->HasAuthority(SpatialConstants::INITIAL_GLOBAL_STATE_MANAGER_ENTITY_ID, SpatialConstants::SINGLETON_MANAGER_COMPONENT_ID))
 	{
 		// Update all clients.
 #if WITH_SERVER_CODE
@@ -1406,6 +1391,11 @@ void USpatialNetDriver::TickFlush(float DeltaTime)
 	// Tick the timer manager
 	{
 		TimerManager.Tick(DeltaTime);
+	}
+
+	if (Connection != nullptr && Connection->IsConnected())
+	{
+		Connection->FlushMessageToSend();
 	}
 
 	Super::TickFlush(DeltaTime);
@@ -1876,109 +1866,4 @@ void USpatialNetDriver::DelayedSendDeleteEntityRequest(Worker_EntityId EntityId,
 	{
 		Sender->SendDeleteEntityRequest(EntityId);
 	}, Delay, false);
-}
-
-void USpatialNetDriver::HandleStartupOpQueueing(const TArray<Worker_OpList*>& InOpLists)
-{
-	if (InOpLists.Num() == 0)
-	{
-		return;
-	}
-
-	QueuedStartupOpLists.Append(InOpLists);
-	bIsReadyToStart = FindAndDispatchStartupOps(InOpLists);
-
-	if (!bIsReadyToStart)
-	{
-	    return;
-	}
-
-	// We've found and dispatched all ops we need for startup, trigger BeginPlay()
-	// on the GSM and process the queued ops.  Note that FindAndDispatchStartupOps()
-	// will have notified the Dispatcher to skip the startup ops that we've
-	// processed already.
-	GlobalStateManager->TriggerBeginPlay();
-
-	for (Worker_OpList* OpList : QueuedStartupOpLists)
-	{
-		Dispatcher->ProcessOps(OpList);
-		Worker_OpList_Destroy(OpList);
-	}
-
-	// Sanity check that the dispatcher encountered, skipped, and removed
-	// all Ops we asked it to skip
-	check(Dispatcher->GetNumOpsToSkip() == 0);
-
-	QueuedStartupOpLists.Empty();
-}
-
-bool USpatialNetDriver::FindAndDispatchStartupOps(const TArray<Worker_OpList*>& InOpLists)
-{
-	TArray<Worker_Op*> FoundOps;
-
-	// Search for entity id reservation response and process it.  The entity id reservation
-	// can fail to reserve entity ids.  In that case, the EntityPool will not be marked ready,
-	// a new query will be sent, and we will process the new response here when it arrives.
-	if (!PackageMap->IsEntityPoolReady())
-	{
-		Worker_Op* EntityIdReservationResponseOp = nullptr;
-		FindFirstOpOfType(InOpLists, WORKER_OP_TYPE_RESERVE_ENTITY_IDS_RESPONSE, &EntityIdReservationResponseOp);
-
-		if (EntityIdReservationResponseOp != nullptr)
-		{
-			FoundOps.Add(EntityIdReservationResponseOp);
-		}
-	}
-
-	// Search for StartupActorManager ops we need and process them
-	if (!GlobalStateManager->IsReadyToCallBeginPlay())
-	{
-		Worker_Op* AddComponentOp = nullptr;
-		FindFirstOpOfTypeForComponent(InOpLists, WORKER_OP_TYPE_ADD_COMPONENT, SpatialConstants::STARTUP_ACTOR_MANAGER_COMPONENT_ID, &AddComponentOp);
-
-		Worker_Op* AuthorityChangedOp = nullptr;
-		FindFirstOpOfTypeForComponent(InOpLists, WORKER_OP_TYPE_AUTHORITY_CHANGE, SpatialConstants::STARTUP_ACTOR_MANAGER_COMPONENT_ID, &AuthorityChangedOp);
-
-		Worker_Op* ComponentUpdateOp = nullptr;
-		FindFirstOpOfTypeForComponent(InOpLists, WORKER_OP_TYPE_COMPONENT_UPDATE, SpatialConstants::STARTUP_ACTOR_MANAGER_COMPONENT_ID, &ComponentUpdateOp);
-
-		if (AddComponentOp != nullptr)
-		{
-			FoundOps.Add(AddComponentOp);
-		}
-
-		if (AuthorityChangedOp != nullptr)
-		{
-			FoundOps.Add(AuthorityChangedOp);
-		}
-
-		if (ComponentUpdateOp != nullptr)
-		{
-			FoundOps.Add(ComponentUpdateOp);
-		}
-	}
-
-	// For each Op we've found, make a Worker_OpList that just contains that Op,
-	// and pass it to the dispatcher for processing. This allows us to avoid copying
-	// the Ops around and dealing with memory that is / should be managed by the Worker SDK.
-	// The Op remains owned by the original OpList.  Finally, notify the dispatcher to skip
-	// these Ops when they are encountered later when we process the queued ops.
-	for (Worker_Op* Op : FoundOps)
-	{
-		Worker_OpList SingleOpList;
-		SingleOpList.op_count = 1;
-		SingleOpList.ops = Op;
-
-		Dispatcher->ProcessOps(&SingleOpList);
-		Dispatcher->MarkOpToSkip(Op);
-	}
-
-	if (PackageMap->IsEntityPoolReady() &&
-		GlobalStateManager->IsReadyToCallBeginPlay())
-	{
-		// Return whether or not we are ready to start
-		return true;
-	}
-
-	return false;
 }
